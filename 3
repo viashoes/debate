@@ -1,0 +1,919 @@
+
+
+import asyncio
+
+import logging
+
+import os
+
+from datetime import datetime, timedelta
+
+
+
+import aiosqlite
+
+import aiohttp
+
+from aiogram import Bot, Dispatcher, F, types
+
+from aiogram.filters import Command, CommandObject
+
+from aiogram.fsm.context import FSMContext
+
+from aiogram.fsm.state import State, StatesGroup
+
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from aiogram.types import LabeledPrice, PreCheckoutQuery, Message, CallbackQuery
+
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from dotenv import load_dotenv
+
+
+
+load_dotenv()
+
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+
+SUB_PRICE = 99
+
+TRIAL_DAYS = 7
+
+DB_PATH = "bot.db"
+
+
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
+
+dp = Dispatcher(storage=MemoryStorage())
+
+
+
+
+
+async def init_db():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute("""
+
+            CREATE TABLE IF NOT EXISTS users (
+
+                user_id INTEGER PRIMARY KEY,
+
+                username TEXT,
+
+                full_name TEXT,
+
+                join_date TEXT,
+
+                trial_until TEXT,
+
+                sub_until TEXT,
+
+                total_paid INTEGER DEFAULT 0,
+
+                is_blocked INTEGER DEFAULT 0
+
+            )
+
+        """)
+
+        await db.execute("""
+
+            CREATE TABLE IF NOT EXISTS payments (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                user_id INTEGER,
+
+                amount INTEGER,
+
+                charge_id TEXT,
+
+                date TEXT
+
+            )
+
+        """)
+
+        await db.commit()
+
+
+
+
+
+async def get_user(user_id: int):
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+
+            row = await cursor.fetchone()
+
+            if row:
+
+                return {
+
+                    "user_id": row[0],
+
+                    "username": row[1],
+
+                    "full_name": row[2],
+
+                    "join_date": row[3],
+
+                    "trial_until": row[4],
+
+                    "sub_until": row[5],
+
+                    "total_paid": row[6],
+
+                    "is_blocked": row[7]
+
+                }
+
+    return None
+
+
+
+
+
+async def create_user(user: types.User):
+
+    now = datetime.utcnow()
+
+    trial_until = (now + timedelta(days=TRIAL_DAYS)).isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+
+            "INSERT OR IGNORE INTO users (user_id, username, full_name, join_date, trial_until) VALUES (?, ?, ?, ?, ?)",
+
+            (user.id, user.username, user.full_name, now.isoformat(), trial_until)
+
+        )
+
+        await db.commit()
+
+
+
+
+
+async def update_sub(user_id: int, days: int = 30, amount: int = 0, charge_id: str = ""):
+
+    user = await get_user(user_id)
+
+    now = datetime.utcnow()
+
+    current_until = datetime.fromisoformat(user["sub_until"]) if user and user["sub_until"] else now
+
+    if current_until < now:
+
+        current_until = now
+
+    new_until = (current_until + timedelta(days=days)).isoformat()
+
+
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+
+            "UPDATE users SET sub_until = ?, total_paid = total_paid + ? WHERE user_id = ?",
+
+            (new_until, amount, user_id)
+
+        )
+
+        if amount > 0:
+
+            await db.execute(
+
+                "INSERT INTO payments (user_id, amount, charge_id, date) VALUES (?, ?, ?, ?)",
+
+                (user_id, amount, charge_id, now.isoformat())
+
+            )
+
+        await db.commit()
+
+
+
+
+
+async def has_access(user_id: int) -> bool:
+
+    if user_id == ADMIN_ID:
+
+        return True
+
+    user = await get_user(user_id)
+
+    if not user:
+
+        return False
+
+    now = datetime.utcnow()
+
+    if user["trial_until"] and datetime.fromisoformat(user["trial_until"]) > now:
+
+        return True
+
+    if user["sub_until"] and datetime.fromisoformat(user["sub_until"]) > now:
+
+        return True
+
+    return False
+
+
+
+
+
+async def get_stats():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        async with db.execute("SELECT COUNT(*) FROM users") as c:
+
+            total_users = (await c.fetchone())[0]
+
+        async with db.execute(
+
+            "SELECT COUNT(*) FROM users WHERE sub_until > ?",
+
+            (datetime.utcnow().isoformat(),)
+
+        ) as c:
+
+            active_subs = (await c.fetchone())[0]
+
+        async with db.execute("SELECT SUM(total_paid) FROM users") as c:
+
+            total_earned = (await c.fetchone())[0] or 0
+
+        async with db.execute("SELECT COUNT(*) FROM payments") as c:
+
+            total_payments = (await c.fetchone())[0]
+
+    return total_users, active_subs, total_earned, total_payments
+
+
+
+
+
+async def ask_ai(messages: list, system: str) -> str:
+
+    headers = {
+
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+
+        "Content-Type": "application/json",
+
+        "HTTP-Referer": "https://t.me",
+
+        "X-Title": "Debate Trainer"
+
+    }
+
+    payload = {
+
+        "model": "meta-llama/llama-3.1-8b-instruct:free",
+
+        "messages": [{"role": "system", "content": system}] + messages,
+
+        "temperature": 0.85,
+
+        "max_tokens": 550
+
+    }
+
+    try:
+
+        async with aiohttp.ClientSession() as session:
+
+            async with session.post(
+
+                "https://openrouter.ai/api/v1/chat/completions",
+
+                json=payload,
+
+                headers=headers,
+
+                timeout=35
+
+            ) as resp:
+
+                data = await resp.json()
+
+                if "choices" in data and data["choices"]:
+
+                    return data["choices"][0]["message"]["content"].strip()
+
+                logging.error(f"OpenRouter response: {data}")
+
+                return "Сейчас не могу ответить. Попробуй чуть позже."
+
+    except Exception as e:
+
+        logging.error(f"AI error: {e}")
+
+        return "Ошибка соединения с ИИ. Попробуй ещё раз."
+
+
+
+
+
+class Debate(StatesGroup):
+
+    waiting_role = State()
+
+    in_debate = State()
+
+
+
+
+
+def main_kb(has_access_flag: bool = True):
+
+    builder = InlineKeyboardBuilder()
+
+    if has_access_flag:
+
+        builder.button(text="🔥 Начать спор", callback_data="start_debate")
+
+        builder.button(text="📊 Мой статус", callback_data="my_status")
+
+    else:
+
+        builder.button(text="⭐ Купить подписку (99⭐/мес)", callback_data="buy_sub")
+
+    builder.button(text="ℹ️ Как это работает", callback_data="how_it_works")
+
+    builder.adjust(1)
+
+    return builder.as_markup()
+
+
+
+
+
+def debate_kb():
+
+    builder = InlineKeyboardBuilder()
+
+    builder.button(text="📝 Оценка аргументов", callback_data="evaluate")
+
+    builder.button(text="🛑 Закончить спор", callback_data="end_debate")
+
+    builder.adjust(1)
+
+    return builder.as_markup()
+
+
+
+
+
+@dp.message(Command("start"))
+
+async def cmd_start(message: Message, state: FSMContext):
+
+    await state.clear()
+
+    await create_user(message.from_user)
+
+    access = await has_access(message.from_user.id)
+
+    text = (
+
+        "Привет! Я бот для тренировки споров.\n\n"
+
+        "Ты пишешь роль оппонента + тему — и я начинаю спорить с тобой как настоящий человек.\n\n"
+
+        "Команды:\n"
+
+        "/start — меню\n"
+
+        "/оценка — оценка аргументов\n"
+
+        "/status — статус подписки"
+
+    )
+
+    if message.from_user.id == ADMIN_ID:
+
+        text += "\n\n👑 Ты админ — тебе всё бесплатно."
+
+    await message.answer(text, reply_markup=main_kb(access))
+
+
+
+
+
+@dp.callback_query(F.data == "how_it_works")
+
+async def how_it_works(callback: CallbackQuery):
+
+    access = await has_access(callback.from_user.id)
+
+    await callback.message.edit_text(
+
+        "Как пользоваться:\n\n"
+
+        "1. Нажми «Начать спор»\n"
+
+        "2. Напиши роль и тему одним сообщением, например:\n"
+
+        "• Строгая мама. Я не хочу ехать на дачу\n"
+
+        "• Ревнивый парень. Я общаюсь с коллегой\n"
+
+        "• Жёсткий начальник. Хочу повышение\n\n"
+
+        "3. Спорь как обычно\n"
+
+        "4. В любой момент нажми «Оценка» или напиши /оценка\n"
+
+        "5. Когда надоест — «Закончить спор»\n\n"
+
+        "7 дней бесплатно, потом 99⭐ в месяц.",
+
+        reply_markup=main_kb(access)
+
+    )
+
+
+
+
+
+@dp.callback_query(F.data == "my_status")
+
+async def my_status(callback: CallbackQuery):
+
+    user = await get_user(callback.from_user.id)
+
+    now = datetime.utcnow()
+
+    if callback.from_user.id == ADMIN_ID:
+
+        status = "👑 Админ (безлимит)"
+
+    elif user and user["sub_until"] and datetime.fromisoformat(user["sub_until"]) > now:
+
+        until = datetime.fromisoformat(user["sub_until"]).strftime("%d.%m.%Y %H:%M")
+
+        status = f"✅ Подписка активна до {until}"
+
+    elif user and user["trial_until"] and datetime.fromisoformat(user["trial_until"]) > now:
+
+        until = datetime.fromisoformat(user["trial_until"]).strftime("%d.%m.%Y %H:%M")
+
+        status = f"🎁 Пробный период до {until}"
+
+    else:
+
+        status = "❌ Подписка неактивна"
+
+    access = await has_access(callback.from_user.id)
+
+    await callback.message.edit_text(
+
+        f"Твой статус:\n\n{status}",
+
+        reply_markup=main_kb(access)
+
+    )
+
+
+
+
+
+@dp.callback_query(F.data == "buy_sub")
+
+async def buy_sub(callback: CallbackQuery):
+
+    prices = [LabeledPrice(label="Подписка на 30 дней", amount=SUB_PRICE)]
+
+    await bot.send_invoice(
+
+        chat_id=callback.from_user.id,
+
+        title="Подписка Debate Trainer",
+
+        description="Полный доступ на 30 дней. Автопродление каждый месяц.",
+
+        payload=f"sub_{callback.from_user.id}",
+
+        provider_token="",
+
+        currency="XTR",
+
+        prices=prices,
+
+        subscription_period=2592000
+
+    )
+
+    await callback.answer()
+
+
+
+
+
+@dp.pre_checkout_query()
+
+async def pre_checkout(query: PreCheckoutQuery):
+
+    await query.answer(ok=True)
+
+
+
+
+
+@dp.message(F.successful_payment)
+
+async def successful_payment(message: Message):
+
+    payment = message.successful_payment
+
+    user_id = message.from_user.id
+
+    await update_sub(
+
+        user_id,
+
+        days=30,
+
+        amount=payment.total_amount,
+
+        charge_id=payment.telegram_payment_charge_id
+
+    )
+
+    await message.answer(
+
+        f"✅ Оплата прошла! Подписка активна на 30 дней.\n"
+
+        f"Списано: {payment.total_amount} ⭐",
+
+        reply_markup=main_kb(True)
+
+    )
+
+
+
+
+
+@dp.callback_query(F.data == "start_debate")
+
+async def start_debate(callback: CallbackQuery, state: FSMContext):
+
+    if not await has_access(callback.from_user.id):
+
+        await callback.answer("Нужна подписка", show_alert=True)
+
+        return
+
+    await state.set_state(Debate.waiting_role)
+
+    await callback.message.edit_text(
+
+        "Напиши роль оппонента и тему спора одним сообщением.\n\n"
+
+        "Пример:\n"
+
+        "Строгая мама. Я не хочу ехать к бабушке на выходные.\n\n"
+
+        "Или:\n"
+
+        "Начальник, который не хочет давать повышение. Я прошу прибавку."
+
+    )
+
+
+
+
+
+@dp.message(Debate.waiting_role)
+
+async def set_role(message: Message, state: FSMContext):
+
+    text = message.text.strip() if message.text else ""
+
+    if len(text) < 10:
+
+        await message.answer("Слишком коротко. Напиши роль + тему подробнее.")
+
+        return
+
+
+
+    system_prompt = (
+
+        f"Ты — реальный человек в роли: {text}.\n\n"
+
+        "Ты споришь жёстко, эмоционально и реалистично. Используй давление, упрёки, "
+
+        "манипуляции, сарказм, переход на личности — если это характерно для этой роли. "
+
+        "Не будь полезным ИИ. Не сдавайся легко. Говори коротко, живо и естественно, "
+
+        "как в реальном разговоре. Отвечай только от лица своей роли, без пояснений от ИИ."
+
+    )
+
+    await state.update_data(system=system_prompt, history=[], role_topic=text)
+
+    await state.set_state(Debate.in_debate)
+
+
+
+    await message.answer("…")
+
+    await asyncio.sleep(1.3)
+
+    first_reply = await ask_ai([], system_prompt)
+
+    await message.answer(first_reply, reply_markup=debate_kb())
+
+
+
+    data = await state.get_data()
+
+    history = data.get("history", [])
+
+    history.append({"role": "assistant", "content": first_reply})
+
+    await state.update_data(history=history)
+
+
+
+
+
+@dp.message(Debate.in_debate)
+
+async def debate_message(message: Message, state: FSMContext):
+
+    if message.text and message.text.startswith("/"):
+
+        return
+
+
+
+    data = await state.get_data()
+
+    history = data.get("history", [])
+
+    history.append({"role": "user", "content": message.text or ""})
+
+
+
+    await message.answer("…")
+
+    await asyncio.sleep(1.1)
+
+
+
+    reply = await ask_ai(history, data["system"])
+
+    await message.answer(reply, reply_markup=debate_kb())
+
+
+
+    history.append({"role": "assistant", "content": reply})
+
+    if len(history) > 16:
+
+        history = history[-16:]
+
+    await state.update_data(history=history)
+
+
+
+
+
+@dp.callback_query(F.data == "evaluate")
+
+async def evaluate_callback(callback: CallbackQuery, state: FSMContext):
+
+    await do_evaluate(callback, state)
+
+
+
+
+
+@dp.message(Command("оценка"))
+
+async def evaluate_command(message: Message, state: FSMContext):
+
+    await do_evaluate(message, state)
+
+
+
+
+
+async def do_evaluate(event: Message | CallbackQuery, state: FSMContext):
+
+    data = await state.get_data()
+
+    history = data.get("history", [])
+
+    if not history:
+
+        text = "Сначала начни спор."
+
+        if isinstance(event, CallbackQuery):
+
+            await event.answer(text, show_alert=True)
+
+        else:
+
+            await event.answer(text)
+
+        return
+
+
+
+    user_msgs = [m["content"] for m in history if m["role"] == "user"]
+
+    prompt = (
+
+        "Ты эксперт по спорам и риторике. Оцени аргументы пользователя по шкале от 1 до 10 "
+
+        "по критериям: логика, убедительность, эмоциональный контроль, сила позиции. "
+
+        "Дай короткий разбор + что можно улучшить. Пиши по-русски, конкретно и честно."
+
+    )
+
+    eval_messages = [{"role": "user", "content": "Вот мои реплики:\n\n" + "\n\n".join(user_msgs)}]
+
+    result = await ask_ai(eval_messages, prompt)
+
+
+
+    text = f"📊 Оценка твоих аргументов:\n\n{result}"
+
+    if isinstance(event, CallbackQuery):
+
+        await event.message.answer(text)
+
+        await event.answer()
+
+    else:
+
+        await event.answer(text)
+
+
+
+
+
+@dp.callback_query(F.data == "end_debate")
+
+async def end_debate(callback: CallbackQuery, state: FSMContext):
+
+    await state.clear()
+
+    access = await has_access(callback.from_user.id)
+
+    await callback.message.edit_text(
+
+        "Спор закончен.",
+
+        reply_markup=main_kb(access)
+
+    )
+
+
+
+
+
+@dp.message(Command("status"))
+
+async def cmd_status(message: Message):
+
+    user = await get_user(message.from_user.id)
+
+    now = datetime.utcnow()
+
+    if message.from_user.id == ADMIN_ID:
+
+        status = "👑 Админ (безлимит)"
+
+    elif user and user["sub_until"] and datetime.fromisoformat(user["sub_until"]) > now:
+
+        until = datetime.fromisoformat(user["sub_until"]).strftime("%d.%m.%Y %H:%M")
+
+        status = f"✅ Подписка активна до {until}"
+
+    elif user and user["trial_until"] and datetime.fromisoformat(user["trial_until"]) > now:
+
+        until = datetime.fromisoformat(user["trial_until"]).strftime("%d.%m.%Y %H:%M")
+
+        status = f"🎁 Пробный период до {until}"
+
+    else:
+
+        status = "❌ Подписка неактивна"
+
+    access = await has_access(message.from_user.id)
+
+    await message.answer(f"Твой статус:\n\n{status}", reply_markup=main_kb(access))
+
+
+
+
+
+@dp.message(Command("admin"))
+
+@dp.message(Command("stats"))
+
+async def admin_panel(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+
+        return
+
+    total_users, active_subs, total_earned, total_payments = await get_stats()
+
+    text = (
+
+        f"👑 Админ-панель\n\n"
+
+        f"👥 Всего пользователей: {total_users}\n"
+
+        f"✅ Активных подписок: {active_subs}\n"
+
+        f"💰 Всего заработано: {total_earned} ⭐\n"
+
+        f"🧾 Количество платежей: {total_payments}\n\n"
+
+        f"Команды:\n"
+
+        f"/stats — обновить статистику\n"
+
+        f"/give_sub USER_ID — выдать подписку на 30 дней"
+
+    )
+
+    await message.answer(text)
+
+
+
+
+
+@dp.message(Command("give_sub"))
+
+async def give_sub(message: Message, command: CommandObject):
+
+    if message.from_user.id != ADMIN_ID:
+
+        return
+
+    if not command.args:
+
+        await message.answer("Использование: /give_sub USER_ID")
+
+        return
+
+    try:
+
+        uid = int(command.args.strip())
+
+        await update_sub(uid, days=30)
+
+        await message.answer(f"✅ Подписка на 30 дней выдана пользователю {uid}")
+
+    except Exception:
+
+        await message.answer("Ошибка. Проверь ID.")
+
+
+
+
+
+async def main():
+
+    await init_db()
+
+    print("Бот запущен...")
+
+    await dp.start_polling(bot)
+
+
+
+
+
+if __name__ == "__main__":
+
+    asyncio.run(main())
